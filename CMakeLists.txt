@@ -27,7 +27,9 @@ project(mqtt_client_dht11 C CXX ASM)
 pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
-add_executable(mqtt_client_dht11 mqtt_client_dht11.c )
+add_executable(mqtt_client_dht11 mqtt_client_dht11.c lib/ssd1306.c)
+
+pico_generate_pio_header(mqtt_client_dht11 ${CMAKE_CURRENT_LIST_DIR}/lib/ws2812.pio)
 
 pico_set_program_name(mqtt_client_dht11 "mqtt_client_dht11")
 pico_set_program_version(mqtt_client_dht11 "0.1")
@@ -39,6 +41,10 @@ pico_enable_stdio_usb(mqtt_client_dht11 1)
 # Add the standard library to the build
 target_link_libraries(mqtt_client_dht11
     pico_stdlib
+    hardware_gpio
+    hardware_i2c
+    hardware_pwm
+    hardware_pio
     pico_cyw43_arch_lwip_threadsafe_background
     pico_lwip_mqtt
     pico_mbedtls

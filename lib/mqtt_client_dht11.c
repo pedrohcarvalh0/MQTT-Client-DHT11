@@ -1,28 +1,28 @@
+/* AULA IoT - Cliente MQTT com DHT11 + Monitoramento Local
+ *
+ * Integração completa: MQTT + Display + LEDs + Buzzer + Matriz LED
+ */
+
 #include <stdio.h>
 #include <stdbool.h>
-#include <math.h>
-
 #include "pico/stdlib.h"
-#include "pico/bootrom.h"
 #include "pico/cyw43_arch.h"
 #include "pico/unique_id.h"
-
-#include "lib/ssd1306.h"
-#include "lib/font.h"
-
-#include "ws2812.pio.h"
-
 #include "hardware/gpio.h"
 #include "hardware/irq.h"
 #include "hardware/timer.h"
 #include "hardware/pwm.h"
 #include "hardware/i2c.h"
 #include "hardware/pio.h"
-
 #include "lwip/apps/mqtt.h"
 #include "lwip/apps/mqtt_priv.h"
 #include "lwip/dns.h"
 #include "lwip/altcp_tls.h"
+#include "lib/ssd1306.h"
+#include "lib/font.h"
+#include "ws2812.pio.h"
+#include "pico/bootrom.h"
+#include <math.h>
 
 // Configurações WiFi e MQTT
 #define WIFI_SSID "KASATECH CARVALHO"
