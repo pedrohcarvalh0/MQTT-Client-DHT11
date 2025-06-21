@@ -1,33 +1,29 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <math.h>
-
+#include <string.h>
 #include "pico/stdlib.h"
-#include "pico/bootrom.h"
 #include "pico/cyw43_arch.h"
 #include "pico/unique_id.h"
-
-#include "lib/ssd1306.h"
-#include "lib/font.h"
-
-#include "ws2812.pio.h"
-
 #include "hardware/gpio.h"
 #include "hardware/irq.h"
 #include "hardware/timer.h"
 #include "hardware/pwm.h"
 #include "hardware/i2c.h"
 #include "hardware/pio.h"
-
 #include "lwip/apps/mqtt.h"
 #include "lwip/apps/mqtt_priv.h"
 #include "lwip/dns.h"
 #include "lwip/altcp_tls.h"
+#include "lib/ssd1306.h"
+#include "lib/font.h"
+#include "ws2812.pio.h"
+#include "pico/bootrom.h"
 
 // Configurações WiFi e MQTT
 #define WIFI_SSID "KASATECH CARVALHO"
 #define WIFI_PASSWORD "Ph01felix!"
-#define MQTT_SERVER "192.168.0.101"
+#define MQTT_SERVER "192.168.0.103"
 #define MQTT_USERNAME "admin"
 #define MQTT_PASSWORD "123456"
 
@@ -54,6 +50,11 @@
 #define DHT_BIT_THRESHOLD_US  50
 #define DHT_READ_INTERVAL_MS  2000
 
+// Configurações FFT
+#define FFT_SIZE        64      // Tamanho da FFT (deve ser potência de 2)
+#define FFT_LOG2_SIZE   6       // log2(64) = 6
+#define SAMPLE_RATE     0.5f    // Taxa de amostragem (0.5 Hz = uma amostra a cada 2 segundos)
+
 // Limiares para os estados de temperatura e umidade
 #define TEMP_GOOD_MAX   25.0f  // Temperatura máxima para estado "bom"
 #define TEMP_ALERT_MAX  30.0f  // Temperatura máxima para estado "alerta"
@@ -72,6 +73,12 @@
 #define MQTT_TOPIC_LEN 100
 #endif
 
+// Estrutura para números complexos
+typedef struct {
+    float real;
+    float imag;
+} complex_t;
+
 // Estrutura para dados DHT11
 typedef struct {
     float humidity;
@@ -85,6 +92,21 @@ typedef enum {
     STATE_ALERT,   // Estado de alerta (amarelo)
     STATE_CRITICAL // Estado crítico (vermelho)
 } system_state_t;
+
+// Estrutura para análise FFT
+typedef struct {
+    float temp_buffer[FFT_SIZE];        // Buffer circular para temperatura
+    float humid_buffer[FFT_SIZE];       // Buffer circular para umidade
+    complex_t temp_fft[FFT_SIZE];       // Resultado FFT temperatura
+    complex_t humid_fft[FFT_SIZE];      // Resultado FFT umidade
+    int buffer_index;                   // Índice atual no buffer circular
+    int samples_count;                  // Contador de amostras coletadas
+    bool fft_ready;                     // Flag indicando se FFT está pronta
+    float temp_dominant_freq;           // Frequência dominante temperatura
+    float humid_dominant_freq;          // Frequência dominante umidade
+    float temp_amplitude;               // Amplitude dominante temperatura
+    float humid_amplitude;              // Amplitude dominante umidade
+} fft_analysis_t;
 
 // Dados do cliente MQTT
 typedef struct {
@@ -101,6 +123,7 @@ typedef struct {
     uint32_t reading_count;
     system_state_t current_state;
     bool mqtt_connected;
+    fft_analysis_t fft_data;            // Dados para análise FFT
 } MQTT_CLIENT_DATA_T;
 
 #ifndef DEBUG_printf
@@ -120,7 +143,7 @@ typedef struct {
 #endif
 
 // Configurações MQTT
-#define TEMP_WORKER_TIME_S 5
+#define TEMP_WORKER_TIME_S 2
 #define MQTT_KEEP_ALIVE_S 60
 #define MQTT_SUBSCRIBE_QOS 1
 #define MQTT_PUBLISH_QOS 1
@@ -142,6 +165,7 @@ PIO pio = pio0;
 int sm = 0;
 uint32_t last_beep_time = 0;
 uint32_t last_read_time = 0;
+uint32_t last_fft_time = 0;
 ssd1306_t oled;
 
 // Padrões para a matriz de LEDs
@@ -174,11 +198,19 @@ static bool dht_read(uint pin, dht_reading_t *result);
 static bool read_dht_bit(uint pin, uint8_t *out_bit);
 static bool read_dht_data_raw(uint pin, uint8_t data[5]);
 
+// Protótipos de funções FFT
+void fft_init(fft_analysis_t *fft);
+void fft_add_sample(fft_analysis_t *fft, float temp, float humid);
+void fft_compute(fft_analysis_t *fft);
+void fft_radix2(complex_t *data, int n, bool inverse);
+void fft_analyze_results(fft_analysis_t *fft);
+void fft_publish_results(MQTT_CLIENT_DATA_T *state);
+
 // Protótipos de funções de monitoramento local
 void update_system_state(MQTT_CLIENT_DATA_T *state, const dht_reading_t *reading);
 void update_rgb_led(system_state_t state);
 void update_led_matrix(system_state_t state);
-void update_display(const dht_reading_t *reading, system_state_t state, bool mqtt_status);
+void update_display(const dht_reading_t *reading, system_state_t state, bool mqtt_status, fft_analysis_t *fft);
 void update_buzzer(system_state_t state);
 void buzzer_init();
 void play_sound(int frequency, int duration_ms);
@@ -211,7 +243,7 @@ void gpio_irq_handler(uint gpio, uint32_t events) {
 int main(void) {
     stdio_init_all();
     sleep_ms(1000);
-    INFO_printf("MQTT DHT11 + Monitoring client starting\n");
+    INFO_printf("MQTT DHT11 + Monitoring + FFT client starting\n");
 
     // Para ser utilizado o modo BOOTSEL com botão B
     gpio_init(BUTTON_B);
@@ -263,6 +295,9 @@ int main(void) {
     state.reading_count = 0;
     state.current_state = STATE_GOOD;
     state.mqtt_connected = false;
+    
+    // Inicializa FFT
+    fft_init(&state.fft_data);
 
     if (cyw43_arch_init()) {
         panic("Failed to initialize CYW43");
@@ -326,6 +361,7 @@ int main(void) {
     // Inicializa variáveis de tempo
     last_read_time = time_us_32() / 1000;
     last_beep_time = last_read_time;
+    last_fft_time = last_read_time;
 
     INFO_printf("Entering main loop\n");
     
@@ -342,21 +378,25 @@ int main(void) {
 
             dht_reading_t current_reading;
             if (dht_read(DHT_PIN, &current_reading)) {
+                // Adiciona amostra para análise FFT
+                fft_add_sample(&state.fft_data, current_reading.temperature_celsius, current_reading.humidity);
+                
                 // Atualiza o estado do sistema com base na leitura
                 update_system_state(&state, &current_reading);
                 
                 // Atualiza os dispositivos de saída locais
                 update_rgb_led(state.current_state);
                 update_led_matrix(state.current_state);
-                update_display(&current_reading, state.current_state, state.mqtt_connected);
+                update_display(&current_reading, state.current_state, state.mqtt_connected, &state.fft_data);
                 
                 // Exibe informações no console
-                printf("[ %lums ] Temperatura: %.1f °C   Umidade: %.1f %%   Estado: %d   MQTT: %s\n",
+                printf("[ %lums ] Temperatura: %.1f °C   Umidade: %.1f %%   Estado: %d   MQTT: %s   FFT: %s\n",
                        (unsigned long)now_ms,
                        current_reading.temperature_celsius,
                        current_reading.humidity,
                        state.current_state,
-                       state.mqtt_connected ? "OK" : "DESCONECTADO");
+                       state.mqtt_connected ? "OK" : "DESCONECTADO",
+                       state.fft_data.fft_ready ? "PRONTA" : "COLETANDO");
                 
                 // Atualiza a leitura no estado para o MQTT
                 state.last_dht_reading = current_reading;
@@ -367,6 +407,19 @@ int main(void) {
                 ssd1306_fill(&oled, false);
                 ssd1306_draw_string(&oled, "Erro de leitura", 8, 28);
                 ssd1306_send_data(&oled);
+            }
+        }
+
+        // Verifica se é hora de calcular FFT (a cada 30 segundos)
+        if (state.fft_data.samples_count >= FFT_SIZE && (now_ms - last_fft_time) >= 30000) {
+            last_fft_time = now_ms;
+            INFO_printf("Computing FFT analysis...\n");
+            fft_compute(&state.fft_data);
+            fft_analyze_results(&state.fft_data);
+            
+            // Publica resultados FFT via MQTT se conectado
+            if (state.mqtt_connected) {
+                fft_publish_results(&state);
             }
         }
 
@@ -386,6 +439,182 @@ int main(void) {
 
     INFO_printf("mqtt client exiting\n");
     return 0;
+}
+
+// ========== IMPLEMENTAÇÃO DAS FUNÇÕES FFT ==========
+
+void fft_init(fft_analysis_t *fft) {
+    memset(fft, 0, sizeof(fft_analysis_t));
+    fft->buffer_index = 0;
+    fft->samples_count = 0;
+    fft->fft_ready = false;
+    INFO_printf("FFT initialized - collecting %d samples\n", FFT_SIZE);
+}
+
+void fft_add_sample(fft_analysis_t *fft, float temp, float humid) {
+    // Adiciona amostras ao buffer circular
+    fft->temp_buffer[fft->buffer_index] = temp;
+    fft->humid_buffer[fft->buffer_index] = humid;
+    
+    fft->buffer_index = (fft->buffer_index + 1) % FFT_SIZE;
+    
+    if (fft->samples_count < FFT_SIZE) {
+        fft->samples_count++;
+        INFO_printf("FFT sample %d/%d collected\n", fft->samples_count, FFT_SIZE);
+    }
+}
+
+void fft_compute(fft_analysis_t *fft) {
+    if (fft->samples_count < FFT_SIZE) {
+        INFO_printf("Not enough samples for FFT\n");
+        return;
+    }
+    
+    // Prepara dados para FFT (temperatura)
+    for (int i = 0; i < FFT_SIZE; i++) {
+        int idx = (fft->buffer_index + i) % FFT_SIZE;
+        fft->temp_fft[i].real = fft->temp_buffer[idx];
+        fft->temp_fft[i].imag = 0.0f;
+    }
+    
+    // Calcula FFT para temperatura
+    fft_radix2(fft->temp_fft, FFT_SIZE, false);
+    
+    // Prepara dados para FFT (umidade)
+    for (int i = 0; i < FFT_SIZE; i++) {
+        int idx = (fft->buffer_index + i) % FFT_SIZE;
+        fft->humid_fft[i].real = fft->humid_buffer[idx];
+        fft->humid_fft[i].imag = 0.0f;
+    }
+    
+    // Calcula FFT para umidade
+    fft_radix2(fft->humid_fft, FFT_SIZE, false);
+    
+    fft->fft_ready = true;
+    INFO_printf("FFT computation completed\n");
+}
+
+void fft_radix2(complex_t *data, int n, bool inverse) {
+    // Implementação FFT Radix-2 Decimation-in-Time
+    int j = 0;
+    
+    // Bit-reversal permutation
+    for (int i = 1; i < n; i++) {
+        int bit = n >> 1;
+        while (j & bit) {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        
+        if (i < j) {
+            complex_t temp = data[i];
+            data[i] = data[j];
+            data[j] = temp;
+        }
+    }
+    
+    // FFT computation
+    for (int len = 2; len <= n; len <<= 1) {
+        float angle = (inverse ? 2.0f : -2.0f) * M_PI / len;
+        complex_t wlen = {cosf(angle), sinf(angle)};
+        
+        for (int i = 0; i < n; i += len) {
+            complex_t w = {1.0f, 0.0f};
+            
+            for (int j = 0; j < len / 2; j++) {
+                complex_t u = data[i + j];
+                complex_t v = {
+                    data[i + j + len/2].real * w.real - data[i + j + len/2].imag * w.imag,
+                    data[i + j + len/2].real * w.imag + data[i + j + len/2].imag * w.real
+                };
+                
+                data[i + j] = (complex_t){u.real + v.real, u.imag + v.imag};
+                data[i + j + len/2] = (complex_t){u.real - v.real, u.imag - v.imag};
+                
+                float w_temp = w.real * wlen.real - w.imag * wlen.imag;
+                w.imag = w.real * wlen.imag + w.imag * wlen.real;
+                w.real = w_temp;
+            }
+        }
+    }
+    
+    if (inverse) {
+        for (int i = 0; i < n; i++) {
+            data[i].real /= n;
+            data[i].imag /= n;
+        }
+    }
+}
+
+void fft_analyze_results(fft_analysis_t *fft) {
+    if (!fft->fft_ready) return;
+    
+    float max_temp_magnitude = 0.0f;
+    float max_humid_magnitude = 0.0f;
+    int max_temp_idx = 0;
+    int max_humid_idx = 0;
+    
+    // Analisa apenas a primeira metade (frequências positivas)
+    for (int i = 1; i < FFT_SIZE / 2; i++) {
+        // Magnitude para temperatura
+        float temp_magnitude = sqrtf(fft->temp_fft[i].real * fft->temp_fft[i].real + 
+                                   fft->temp_fft[i].imag * fft->temp_fft[i].imag);
+        
+        if (temp_magnitude > max_temp_magnitude) {
+            max_temp_magnitude = temp_magnitude;
+            max_temp_idx = i;
+        }
+        
+        // Magnitude para umidade
+        float humid_magnitude = sqrtf(fft->humid_fft[i].real * fft->humid_fft[i].real + 
+                                    fft->humid_fft[i].imag * fft->humid_fft[i].imag);
+        
+        if (humid_magnitude > max_humid_magnitude) {
+            max_humid_magnitude = humid_magnitude;
+            max_humid_idx = i;
+        }
+    }
+    
+    // Calcula frequências dominantes
+    fft->temp_dominant_freq = (float)max_temp_idx * SAMPLE_RATE / FFT_SIZE;
+    fft->humid_dominant_freq = (float)max_humid_idx * SAMPLE_RATE / FFT_SIZE;
+    fft->temp_amplitude = max_temp_magnitude;
+    fft->humid_amplitude = max_humid_magnitude;
+    
+    INFO_printf("FFT Analysis Results:\n");
+    INFO_printf("Temperature - Dominant Freq: %.4f Hz, Amplitude: %.2f\n", 
+                fft->temp_dominant_freq, fft->temp_amplitude);
+    INFO_printf("Humidity - Dominant Freq: %.4f Hz, Amplitude: %.2f\n", 
+                fft->humid_dominant_freq, fft->humid_amplitude);
+}
+
+void fft_publish_results(MQTT_CLIENT_DATA_T *state) {
+    if (!state->fft_data.fft_ready || !state->mqtt_connected) return;
+    
+    char fft_data[256];
+    
+    // Publica análise FFT da temperatura
+    snprintf(fft_data, sizeof(fft_data), 
+             "{\"freq\":%.4f,\"amplitude\":%.2f,\"period_min\":%.1f}", 
+             state->fft_data.temp_dominant_freq,
+             state->fft_data.temp_amplitude,
+             state->fft_data.temp_dominant_freq > 0 ? (1.0f / state->fft_data.temp_dominant_freq / 60.0f) : 0);
+    
+    mqtt_publish(state->mqtt_client_inst, full_topic(state, "/temperature/fft"), 
+                fft_data, strlen(fft_data), MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, state);
+    
+    // Publica análise FFT da umidade
+    snprintf(fft_data, sizeof(fft_data), 
+             "{\"freq\":%.4f,\"amplitude\":%.2f,\"period_min\":%.1f}", 
+             state->fft_data.humid_dominant_freq,
+             state->fft_data.humid_amplitude,
+             state->fft_data.humid_dominant_freq > 0 ? (1.0f / state->fft_data.humid_dominant_freq / 60.0f) : 0);
+    
+    mqtt_publish(state->mqtt_client_inst, full_topic(state, "/humidity/fft"), 
+                fft_data, strlen(fft_data), MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, state);
+    
+    INFO_printf("FFT results published via MQTT\n");
 }
 
 // ========== IMPLEMENTAÇÃO DAS FUNÇÕES DHT11 ==========
@@ -524,15 +753,16 @@ void update_led_matrix(system_state_t state) {
     }
 }
 
-void update_display(const dht_reading_t *reading, system_state_t state, bool mqtt_status) {
-    char temp_str[16];
-    char humid_str[16];
-    char status_str[16];
-    char mqtt_str[16];
+void update_display(const dht_reading_t *reading, system_state_t state, bool mqtt_status, fft_analysis_t *fft) {
+    char temp_str[20];
+    char humid_str[20];
+    char status_str[20];
+    char mqtt_str[20];
+    char fft_str[20];
     
-    sprintf(temp_str, "Temp: %.1f C", reading->temperature_celsius);
-    sprintf(humid_str, "Umid: %.1f %%", reading->humidity);
-    sprintf(mqtt_str, "MQTT: %s", mqtt_status ? "OK" : "OFF");
+    sprintf(temp_str, "T:%.1fC", reading->temperature_celsius);
+    sprintf(humid_str, "H:%.1f%%", reading->humidity);
+    sprintf(mqtt_str, "MQTT:%s", mqtt_status ? "OK" : "OFF");
     
     switch (state) {
         case STATE_GOOD:
@@ -546,17 +776,23 @@ void update_display(const dht_reading_t *reading, system_state_t state, bool mqt
             break;
     }
     
+    if (fft->fft_ready) {
+        sprintf(fft_str, "FFT: %.3fHz", fft->temp_dominant_freq);
+    } else {
+        sprintf(fft_str, "FFT: %d/%d", fft->samples_count, FFT_SIZE);
+    }
+    
     ssd1306_fill(&oled, false);
     ssd1306_rect(&oled, 0, 0, WIDTH, HEIGHT, true, false);
     
-    ssd1306_draw_string(&oled, "MONITORAMENTO", 8, 2);
+    ssd1306_draw_string(&oled, "MONITOR+FFT", 16, 2);
     ssd1306_line(&oled, 0, 12, WIDTH-1, 12, true);
     
     ssd1306_draw_string(&oled, temp_str, 8, 16);
-    ssd1306_draw_string(&oled, humid_str, 8, 26);
-    ssd1306_line(&oled, 0, 36, WIDTH-1, 36, true);
-    ssd1306_draw_string(&oled, status_str, 8, 40);
-    ssd1306_draw_string(&oled, mqtt_str, 8, 52);
+    ssd1306_draw_string(&oled, humid_str, 70, 16);
+    ssd1306_draw_string(&oled, status_str, 8, 26);
+    ssd1306_draw_string(&oled, mqtt_str, 8, 36);
+    ssd1306_draw_string(&oled, fft_str, 8, 46);
     
     ssd1306_send_data(&oled);
 }
