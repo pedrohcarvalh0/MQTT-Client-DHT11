@@ -21,11 +21,11 @@
 #include "pico/bootrom.h"
 
 // Configurações WiFi e MQTT
-#define WIFI_SSID "KASATECH CARVALHO"
-#define WIFI_PASSWORD "Ph01felix!"
-#define MQTT_SERVER "192.168.0.103"
-#define MQTT_USERNAME "admin"
-#define MQTT_PASSWORD "123456"
+#define WIFI_SSID "NOME DA SUA REDE WIFI"
+#define WIFI_PASSWORD "SENHA DA SUA REDE WIFI"
+#define MQTT_SERVER "ENDEREÇO IP DO BROKER"
+#define MQTT_USERNAME "USERNAME DEFINIDO NO BROKER"
+#define MQTT_PASSWORD "SENHA DEFINIDA NO BROKER"
 
 // Definições de pinos
 #define BUTTON_B        6
